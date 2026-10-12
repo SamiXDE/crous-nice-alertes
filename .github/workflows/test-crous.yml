@@ -1,0 +1,73 @@
+
+name: Tester le site CROUS Nice
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Installer le lecteur HTML
+        run: python3 -m pip install beautifulsoup4
+
+      - name: Lire les annonces CROUS Nice
+        run: |
+          python3 - <<'PY'
+          import re
+          from urllib.request import Request, urlopen
+          from bs4 import BeautifulSoup
+
+          url = (
+              "https://trouverunlogement.lescrous.fr/tools/47/search"
+              "?bounds=7.1819535_43.7607635_7.323912_43.6454189"
+              "&locationName=Nice"
+          )
+
+          req = Request(url, headers={
+              "User-Agent": "Mozilla/5.0",
+              "Accept-Language": "fr-FR,fr;q=0.9"
+          })
+
+          print("Connexion au site officiel CROUS...")
+
+          with urlopen(req, timeout=30) as response:
+              html = response.read()
+              print("HTTP:", response.status)
+
+          soup = BeautifulSoup(html, "html.parser")
+
+          if soup.title:
+              print("Titre:", soup.title.get_text(" ", strip=True))
+
+          cards = soup.select("li.fr-col-lg-4")
+          print("Fiches detectees:", len(cards))
+
+          for card in cards[:5]:
+              title = card.select_one("h3.fr-card__title")
+              address = card.select_one("p.fr-card__desc")
+              print(
+                  "Annonce:",
+                  title.get_text(" ", strip=True) if title else "?",
+                  "|",
+                  address.get_text(" ", strip=True) if address else "?"
+              )
+
+          texte = soup.get_text(" ", strip=True).lower()
+
+          if "logement" not in texte or "nice" not in texte:
+              raise SystemExit("Page CROUS Nice non reconnue")
+
+          if cards:
+              if not any("nice" in c.get_text(" ", strip=True).lower()
+                         for c in cards):
+                  raise SystemExit("Filtre Nice non confirme")
+          elif not re.search(r"aucun logement|0 logements", texte):
+              raise SystemExit("Resultat vide non confirme")
+
+          print("Test de lecture CROUS termine.")
+          PY
