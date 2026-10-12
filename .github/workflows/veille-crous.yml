@@ -1,0 +1,176 @@
+name: Alerte CROUS Nice
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Minutes 03, 08, 13, ... : toutes les 5 minutes programmees.
+    - cron: '3-58/5 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: surveillance-crous-nice
+  cancel-in-progress: false
+
+jobs:
+  surveillance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+
+      - name: Installer BeautifulSoup
+        run: python3 -m pip install --disable-pip-version-check beautifulsoup4
+
+      - name: Verifier les annonces et notifier Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlencode
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from bs4 import BeautifulSoup
+
+          BASE = "https://trouverunlogement.lescrous.fr"
+          PATH = "/tools/47/search"
+          PARAMS = {
+              "bounds": "7.1819535_43.7607635_7.323912_43.6454189",
+              "locationName": "Nice",
+          }
+          SEARCH_URL = BASE + PATH + "?" + urlencode(PARAMS)
+          STATE = Path("crous_annonces_vues.json")
+          TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+          if not TOKEN or not CHAT_ID:
+              raise SystemExit("Secrets Telegram manquants.")
+
+          def envoyer(message):
+              data = urlencode({"chat_id": CHAT_ID, "text": message}).encode()
+              request = Request(
+                  "https://api.telegram.org/bot" + TOKEN + "/sendMessage",
+                  data=data,
+              )
+              try:
+                  with urlopen(request, timeout=20) as response:
+                      reply = json.load(response)
+              except HTTPError as exc:
+                  raise SystemExit(f"Echec Telegram (HTTP {exc.code}).")
+              except URLError:
+                  raise SystemExit("Connexion Telegram impossible.")
+              if not reply.get("ok"):
+                  raise SystemExit("Telegram a refuse le message.")
+
+          def lire_page(page=None):
+              params = PARAMS.copy()
+              if page is not None:
+                  params["page"] = page
+              url = BASE + PATH + "?" + urlencode(params)
+              req = Request(url, headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept-Language": "fr-FR,fr;q=0.9",
+              })
+              try:
+                  with urlopen(req, timeout=30) as response:
+                      if response.status != 200:
+                          raise SystemExit("Reponse CROUS inattendue.")
+                      content = response.read()
+              except HTTPError as exc:
+                  raise SystemExit(f"Le site CROUS retourne HTTP {exc.code}.")
+              except URLError:
+                  raise SystemExit("Le site CROUS ne repond pas.")
+              return BeautifulSoup(content, "html.parser")
+
+          def extraire(soup):
+              results = {}
+              raw_cards = soup.select("li.fr-col-lg-4")
+              for card in raw_cards:
+                  anchor = card.select_one("h3.fr-card__title a[href]")
+                  if not anchor:
+                      continue
+                  href = anchor.get("href", "").strip()
+                  if not href:
+                      continue
+                  link = urljoin(BASE, href)
+                  name = anchor.get_text(" ", strip=True)
+                  address = card.select_one("p.fr-card__desc")
+                  price = card.select_one(".fr-badges-group .fr-badge")
+                  if name:
+                      results[link] = {
+                          "name": name,
+                          "address": address.get_text(" ", strip=True) if address else "",
+                          "price": price.get_text(" ", strip=True) if price else "",
+                          "link": link,
+                      }
+              if raw_cards and not results:
+                  raise SystemExit("Les cartes CROUS ont change de format : verifier le selecteur.")
+              return results
+
+          first = lire_page()
+          title = first.title.get_text(" ", strip=True) if first.title else ""
+          text = first.get_text(" ", strip=True).lower()
+          if "crous" not in text and "logement" not in text:
+              raise SystemExit("Ce n'est pas une page de resultats CROUS.")
+
+          records = extraire(first)
+          match = re.search(r"page\s+\d+\s+sur\s+(\d+)", title, re.I)
+          pages = int(match.group(1)) if match else 1
+          if pages > 20:
+              raise SystemExit("Nombre de pages inattendu : verifier le site.")
+          for page in range(2, pages + 1):
+              time.sleep(0.7)
+              records.update(extraire(lire_page(page)))
+
+          if not records and not re.search(
+              r"aucun logement|aucune annonce|0 logements|page 0 sur 0",
+              text + " " + title.lower(),
+          ):
+              raise SystemExit("Impossible de confirmer qu'il n'y a aucun logement.")
+
+          previous = set(json.loads(STATE.read_text(encoding="utf-8"))) if STATE.exists() else set()
+          new_links = sorted(set(records) - previous)
+          print(f"CROUS Nice : {len(records)} fiche(s), {len(new_links)} nouvelle(s).")
+
+          for link in new_links:
+              item = records[link]
+              message = (
+                  "🏠 NOUVEAU LOGEMENT CROUS - NICE !\n\n"
+                  f"{item['name']}\n"
+                  f"{item['address']}\n"
+                  f"{item['price']}\n\n"
+                  f"Consulter : {item['link']}"
+              )
+              envoyer(message)
+              time.sleep(0.2)
+
+          if not new_links and os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+              envoyer(
+                  "✅ Surveillance CROUS Nice : controle manuel termine. "
+                  f"{len(records)} annonce(s) visible(s), aucune nouvelle alerte."
+              )
+
+          STATE.write_text(
+              json.dumps(sorted(records), ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Memoriser les annonces pour la prochaine verification
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crous_annonces_vues.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Etat des annonces CROUS Nice [skip ci]'
+            git push
+          else
+            echo 'Aucune modification des annonces.'
+          fi
