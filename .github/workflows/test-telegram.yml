@@ -1,0 +1,40 @@
+
+name: Test Telegram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Envoyer une notification Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          data = urllib.parse.urlencode({
+              "chat_id": chat_id,
+              "text": "✅ Test réussi ! Ton bot CROUS Nice fonctionne."
+          }).encode("utf-8")
+
+          request = urllib.request.Request(url, data=data)
+
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  print("Message Telegram envoyé !")
+          except Exception:
+              raise SystemExit("Envoi échoué : vérifie les secrets Telegram.")
+          PY
